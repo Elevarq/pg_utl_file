@@ -16,6 +16,7 @@ typedef struct {
     FILE *fp;
     bool in_use;
     SubTransactionId subid;
+    int max_linesize;
 } UTLFileHandle;
 
 static UTLFileHandle file_handles[MAX_OPEN_FILES];
@@ -68,6 +69,7 @@ PG_FUNCTION_INFO_V1(utl_file_fopen);
 Datum utl_file_fopen(PG_FUNCTION_ARGS) {
     text *filepath_txt = PG_GETARG_TEXT_PP(0);
     text *mode_txt = PG_GETARG_TEXT_PP(1);
+    int32 max_linesize = PG_GETARG_INT32(2);
     char *fullpath = text_to_cstring(filepath_txt);
     char *mode = text_to_cstring(mode_txt);
     char c_mode[3] = {0};
@@ -75,6 +77,14 @@ Datum utl_file_fopen(PG_FUNCTION_ARGS) {
     int i;
     FILE *fp;
     struct stat st;
+
+    /* Oracle's UTL_FILE caps the line size at 1..32767; enforce the same so a
+     * huge physical line cannot balloon backend memory in get_line(). */
+    if (max_linesize < 1 || max_linesize > 32767) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                        errmsg("UTL_FILE invalid max_linesize %d: must be between 1 and 32767",
+                               max_linesize)));
+    }
 
     if (strstr(fullpath, "..") != NULL) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_NAME),
@@ -127,6 +137,7 @@ Datum utl_file_fopen(PG_FUNCTION_ARGS) {
     file_handles[slot].fp = fp;
     file_handles[slot].in_use = true;
     file_handles[slot].subid = GetCurrentSubTransactionId();
+    file_handles[slot].max_linesize = max_linesize;
 
     PG_RETURN_INT32(file_handles[slot].id);
 }
@@ -171,6 +182,7 @@ PG_FUNCTION_INFO_V1(utl_file_get_line);
 Datum utl_file_get_line(PG_FUNCTION_ARGS) {
     int id = PG_GETARG_INT32(0);
     FILE *fp = NULL;
+    int max_linesize = 1024;
     StringInfoData buf;
     char tmp[1024];
     int i;
@@ -178,6 +190,7 @@ Datum utl_file_get_line(PG_FUNCTION_ARGS) {
     for (i = 0; i < MAX_OPEN_FILES; i++) {
         if (file_handles[i].in_use && file_handles[i].id == id) {
             fp = file_handles[i].fp;
+            max_linesize = file_handles[i].max_linesize;
             break;
         }
     }
@@ -188,7 +201,16 @@ Datum utl_file_get_line(PG_FUNCTION_ARGS) {
 
     initStringInfo(&buf);
 
-    while (fgets(tmp, sizeof(tmp), fp) != NULL) {
+    /* Read a line but never let the buffer exceed max_linesize. fgets reads at
+     * most (want-1) bytes, so sizing the read to the remaining budget bounds
+     * the buffer at max_linesize. A physical line longer than max_linesize is
+     * returned as successive max_linesize chunks rather than buffered whole. */
+    while (buf.len < max_linesize) {
+        int want = max_linesize - buf.len + 1;
+        if (want > (int) sizeof(tmp))
+            want = (int) sizeof(tmp);
+        if (fgets(tmp, want, fp) == NULL)
+            break;
         appendStringInfoString(&buf, tmp);
         if (buf.len > 0 && buf.data[buf.len - 1] == '\n') {
             buf.data[buf.len - 1] = '\0';

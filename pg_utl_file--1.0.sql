@@ -14,7 +14,7 @@ REVOKE ALL ON utl_file_directories FROM public;
 -- only to the specific roles that call the UTL_FILE API.
 GRANT SELECT ON utl_file_directories TO public;
 
-CREATE FUNCTION _utl_file_fopen(filepath text, mode text) RETURNS integer
+CREATE FUNCTION _utl_file_fopen(filepath text, mode text, max_linesize integer) RETURNS integer
 AS 'MODULE_PATHNAME', 'utl_file_fopen'
 LANGUAGE C STRICT;
 
@@ -43,7 +43,7 @@ LANGUAGE C STRICT;
 -- directly, or the directory whitelist and traversal checks below are
 -- bypassed entirely. Revoke the default PUBLIC EXECUTE and expose the
 -- functionality only through the SECURITY DEFINER wrappers.
-REVOKE ALL ON FUNCTION _utl_file_fopen(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION _utl_file_fopen(text, text, integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION _utl_file_put_line(integer, text, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION _utl_file_get_line(integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION _utl_file_fflush(integer) FROM PUBLIC;
@@ -76,7 +76,9 @@ BEGIN
     END IF;
 
     v_full_path := v_dir_path || '/' || filename;
-    v_res.id := @extschema@._utl_file_fopen(v_full_path, open_mode);
+    -- max_linesize is now honored (previously accepted and ignored). COALESCE
+    -- guards an explicit NULL, since _utl_file_fopen is STRICT.
+    v_res.id := @extschema@._utl_file_fopen(v_full_path, open_mode, COALESCE(max_linesize, 1024));
 
     RETURN v_res;
 END;
